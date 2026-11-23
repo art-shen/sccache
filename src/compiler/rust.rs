@@ -23,6 +23,7 @@ use crate::compiler::{
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
+use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
@@ -1958,17 +1959,11 @@ fn strip_basedirs_os<'a>(value: &'a OsStr, basedirs: &[Vec<u8>]) -> Cow<'a, OsSt
 }
 
 /// The Cargo build directory holding `output_dir`, as a basedir: its nearest ancestor with
-/// `.rustc_info.json` or `CACHEDIR.TAG`, which Cargo writes at the top of a build directory (and
-/// of `<triple>/` under it). Either can be missing: `CACHEDIR.TAG` when the directory existed
-/// before Cargo ran, `.rustc_info.json` with `CARGO_CACHE_RUSTC_INFO=0`.
-///
-/// A shared `build.build-dir` with `{workspace-path-hash}` puts this directory outside every
-/// checkout, so no basedir covers it. Below it, paths are the same in every workspace. The
-/// directory layout below it changes between Cargo versions, so only the markers are used.
+/// `.rustc_info.json` or `CACHEDIR.TAG`. Cargo writes both there, but either can be missing.
 fn cargo_build_root_basedir(output_dir: &Path) -> Option<Vec<u8>> {
-    let root = output_dir
-        .ancestors()
-        .find(|dir| dir.join(".rustc_info.json").is_file() || dir.join("CACHEDIR.TAG").is_file())?;
+    let root = output_dir.ancestors().find(|dir| {
+        dir.join(".rustc_info.json").is_file() || dir.join(CACHEDIR_TAG_FILE_NAME).is_file()
+    })?;
     let mut b = root.to_str()?.as_bytes().to_vec();
     b.push(b'/');
     Some(if cfg!(windows) {
@@ -2249,7 +2244,7 @@ where
         let verbatim = basedirs_verbatim_env_deps(&env_vars, basedirs);
         let env_dep_basedirs: Cow<'_, [Vec<u8>]> = match basedirs {
             [] => Cow::Borrowed(basedirs),
-            _ => match cargo_build_root_basedir(&self.parsed_args.output_dir) {
+            _ => match cargo_build_root_basedir(&cwd.join(&self.parsed_args.output_dir)) {
                 Some(root) => Cow::Owned(basedirs.iter().cloned().chain([root]).collect()),
                 None => Cow::Borrowed(basedirs),
             },
@@ -5099,12 +5094,15 @@ foo.rs:
 
     /// Two workspaces whose Cargo build directories lie outside every basedir (one shared
     /// `build-dir` per workspace hash) key a build script's `OUT_DIR` alike once any basedir
-    /// is configured, and stay apart without one.
+    /// is configured, and stay apart without one or without a build directory marker.
     #[test]
     fn test_equal_hashes_out_dir_in_cargo_build_root() {
-        fn key(f: &TestFixture, build_root: &Path, basedirs: Vec<Vec<u8>>) -> String {
+        fn key(f: &TestFixture, ws: &str, marker: Option<&str>, basedirs: Vec<Vec<u8>>) -> String {
+            let build_root = f.tempdir.path().join(ws);
             fs::create_dir_all(build_root.join("debug/build/foo-1/out")).unwrap();
-            fs::write(build_root.join(".rustc_info.json"), "{}").unwrap();
+            if let Some(marker) = marker {
+                fs::write(build_root.join(marker), "{}").unwrap();
+            }
             hash_key_with(
                 f,
                 &[
@@ -5112,7 +5110,8 @@ foo.rs:
                     "link".into(),
                     "foo.rs".into(),
                     "--out-dir".into(),
-                    build_root.join("debug/deps").into(),
+                    // Relative, so the compile's cwd (the fixture's tempdir) must resolve it.
+                    Path::new(ws).join("debug/deps").into(),
                     "--crate-name".into(),
                     "foo".into(),
                     "--crate-type".into(),
@@ -5128,11 +5127,19 @@ foo.rs:
             )
         }
 
+        for marker in [".rustc_info.json", CACHEDIR_TAG_FILE_NAME] {
+            let f = TestFixture::new();
+            let key = |ws, basedirs| key(&f, ws, Some(marker), basedirs);
+            assert_ne!(key("ws-a", vec![]), key("ws-b", vec![]));
+            let any = vec![basedir(&f.tempdir.path().join("checkouts"))];
+            assert_eq!(key("ws-a", any.clone()), key("ws-b", any));
+        }
         let f = TestFixture::new();
-        let (a, b) = (f.tempdir.path().join("ws-a"), f.tempdir.path().join("ws-b"));
-        assert_ne!(key(&f, &a, vec![]), key(&f, &b, vec![]));
         let any = vec![basedir(&f.tempdir.path().join("checkouts"))];
-        assert_eq!(key(&f, &a, any.clone()), key(&f, &b, any));
+        assert_ne!(
+            key(&f, "ws-a", None, any.clone()),
+            key(&f, "ws-b", None, any)
+        );
     }
 
     /// `option_env!("Y")` is `None` when `Y` is unset and `Some("")` when it is empty,
