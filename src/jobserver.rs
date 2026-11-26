@@ -39,10 +39,59 @@ pub struct Client {
     tx: Option<mpsc::UnboundedSender<oneshot::Sender<io::Result<jobserver::Acquired>>>>,
     inner: jobserver::Client,
     fifo: bool,
+    pool: Option<Arc<Pool>>,
 }
 
+/// Refills our private pool. Children we share it with (rustc) take tokens of
+/// their own, and one killed mid-compile never writes them back; the pool lives
+/// as long as the server, so the losses add up and the server runs ever fewer
+/// compiles at once, down to one. When no token is held or awaited by us, every
+/// token belongs in the pipe, so the shortfall there is exactly what was lost.
+/// Tokens on their way to a waiting compile cannot be counted, so a busy server
+/// stays short until its next idle moment.
+struct Pool {
+    client: jobserver::Client,
+    capacity: usize,
+    // Held or awaited tokens. Changed under the lock that also covers a refill,
+    // so a refill never races a read for a new token.
+    busy: std::sync::Mutex<usize>,
+}
+
+impl Pool {
+    fn enter(self: &Arc<Self>) -> Acquired {
+        *self.busy.lock().unwrap() += 1;
+        Acquired {
+            token: None,
+            pool: Some(self.clone()),
+        }
+    }
+}
+
+/// Also the guard of [`Pool::busy`]: dropping it, acquired or not, leaves.
 pub struct Acquired {
-    _token: Option<jobserver::Acquired>,
+    token: Option<jobserver::Acquired>,
+    pool: Option<Arc<Pool>>,
+}
+
+impl Drop for Acquired {
+    fn drop(&mut self) {
+        // The token goes back before the shortfall is measured.
+        drop(self.token.take());
+        let Some(pool) = &self.pool else { return };
+        let mut busy = pool.busy.lock().unwrap();
+        *busy -= 1;
+        if *busy == 0 {
+            // Both ways: a cancelled `acquire` whose read was already under way
+            // puts its byte back after this count, leaving one too many.
+            let available = pool.client.available().unwrap_or(pool.capacity);
+            for _ in available..pool.capacity {
+                drop(pool.client.release_raw());
+            }
+            for _ in pool.capacity..available {
+                drop(pool.client.acquire_raw());
+            }
+        }
+    }
 }
 
 impl Client {
@@ -68,7 +117,13 @@ impl Client {
 
     pub fn new_num(num: usize) -> Client {
         let inner = jobserver::Client::new(num).expect("failed to create jobserver");
-        Client::_new(inner, false)
+        let mut client = Client::_new(inner, false);
+        client.pool = Some(Arc::new(Pool {
+            client: client.inner.clone(),
+            capacity: num,
+            busy: Default::default(),
+        }));
+        client
     }
 
     fn _new(inner: jobserver::Client, fifo: bool) -> Client {
@@ -97,6 +152,7 @@ impl Client {
             helper,
             tx,
             fifo,
+            pool: None,
         }
     }
 
@@ -119,7 +175,20 @@ impl Client {
     pub async fn acquire(&self) -> Result<Acquired> {
         let (helper, tx) = match (self.helper.as_ref(), self.tx.as_ref()) {
             (Some(a), Some(b)) => (a, b),
-            _ => return Ok(Acquired { _token: None }),
+            _ => {
+                return Ok(Acquired {
+                    token: None,
+                    pool: None,
+                });
+            }
+        };
+        // Entered before the read, so a refill never runs while it is under way.
+        let mut guard = match &self.pool {
+            Some(pool) => pool.enter(),
+            None => Acquired {
+                token: None,
+                pool: None,
+            },
         };
         let (mytx, myrx) = oneshot::channel();
         helper.request_token();
@@ -130,9 +199,8 @@ impl Client {
             .context("jobserver helper panicked")?
             .context("failed to acquire jobserver token")?;
 
-        Ok(Acquired {
-            _token: Some(acquired),
-        })
+        guard.token = Some(acquired);
+        Ok(guard)
     }
 }
 
@@ -167,5 +235,42 @@ mod test {
     #[test]
     fn private_pool_is_not_fifo() {
         assert!(!Client::new_num(1).is_fifo());
+    }
+
+    /// rustc takes extra tokens from the pool we share with it, and a rustc
+    /// killed mid-compile (the server kills one whose client went away) never
+    /// writes them back. The pool lives as long as the server, so each such
+    /// kill shrinks it.
+    #[test]
+    #[cfg(unix)]
+    fn tokens_held_by_a_killed_child_return_to_the_pool() {
+        use crate::mock_command::{
+            CommandChild, CommandCreator, ProcessCommandCreator, RunCommand,
+        };
+        use tokio::io::AsyncReadExt;
+
+        let client = Client::new_num(2);
+        let mut creator = <ProcessCommandCreator as CommandCreator>::new(&client);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut cmd = creator.new_command("/bin/sh");
+            cmd.args(&[
+                "-c",
+                "a=${CARGO_MAKEFLAGS##*--jobserver-auth=}; a=${a%% *}; \
+                 head -c1 <&${a%%,*} >/dev/null && echo held && exec sleep 60",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .share_jobserver();
+            let mut child = cmd.spawn().await.unwrap();
+            let mut held = [0; 4];
+            child
+                .take_stdout()
+                .unwrap()
+                .read_exact(&mut held)
+                .await
+                .unwrap();
+            drop(child);
+        });
+        assert_eq!(client.inner.available().unwrap(), 2);
     }
 }
